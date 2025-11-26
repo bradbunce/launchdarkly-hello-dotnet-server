@@ -1,0 +1,9 @@
+﻿<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="LaunchDarkly.ServerSdk" Version="8.10.4" />
+    <PackageReference Include="LaunchDarkly.ServerSdk.Ai" Version="0.9.1" />
+  </ItemGroup>
+</Project>
