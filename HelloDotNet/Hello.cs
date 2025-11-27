@@ -1,6 +1,8 @@
 ﻿// System namespaces for core functionality
 using System;
 using System.Collections.Concurrent;  // Thread-safe collections
+using System.Collections.Generic;  // For Dictionary and other generic collections
+using System.Diagnostics;  // For Activity and ActivityKind (observability spans)
 using System.IO;
 using System.Net.Http;  // For making HTTP requests to AI providers
 using System.Text;
@@ -11,17 +13,20 @@ using System.Threading.Tasks;  // For async/await support
 // LaunchDarkly SDK namespaces
 using LaunchDarkly.Sdk;  // Core SDK types
 using LaunchDarkly.Sdk.Server;  // Server-side SDK for feature flags
+using LaunchDarkly.Sdk.Server.Integrations;  // Plugin configuration
 using LaunchDarkly.Sdk.Server.Ai;  // AI Config support
 using LaunchDarkly.Sdk.Server.Ai.Adapters;  // Adapters for AI SDK
 using LaunchDarkly.Sdk.Server.Ai.Config;  // AI Config types
 using LaunchDarkly.Sdk.Server.Ai.Interfaces;  // AI SDK interfaces
 using LaunchDarkly.Sdk.Server.Ai.Tracking;  // Metrics tracking (duration, tokens, feedback)
+using LaunchDarkly.Observability;  // Observability support
 
 // ASP.NET Core namespaces for web server
 using Microsoft.AspNetCore;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;  // For LogLevel
 
 namespace HelloDotNet
 {
@@ -132,61 +137,78 @@ namespace HelloDotNet
         /// <returns>AI response with text and token usage</returns>
         public static async Task<AiResponse> CallOpenRouter(string userMessage, string modelName, string apiKey)
         {
-            try
+            using (var activity = Observe.StartActivity("openrouter.chat.completions", ActivityKind.Client,
+                new Dictionary<string, object> 
+                { 
+                    { "ai.provider", "openrouter" },
+                    { "ai.model", modelName },
+                    { "message.length", userMessage?.Length ?? 0 }
+                }))
             {
-                var requestBody = new
+                try
                 {
-                    model = modelName,
-                    messages = new[]
+                    var requestBody = new
                     {
-                        new { role = "user", content = userMessage }
-                    }
-                };
-
-                var request = new HttpRequestMessage(HttpMethod.Post, "https://openrouter.ai/api/v1/chat/completions");
-                request.Headers.Add("Authorization", $"Bearer {apiKey}");
-                request.Content = new StringContent(
-                    JsonSerializer.Serialize(requestBody),
-                    Encoding.UTF8,
-                    "application/json"
-                );
-
-                var response = await httpClient.SendAsync(request);
-                var responseBody = await response.Content.ReadAsStringAsync();
-
-                if (response.IsSuccessStatusCode)
-                {
-                    var jsonResponse = JsonSerializer.Deserialize<JsonElement>(responseBody);
-                    var text = jsonResponse.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString() ?? "No response";
-                    
-                    var usage = jsonResponse.GetProperty("usage");
-                    return new AiResponse
-                    {
-                        Text = text,
-                        InputTokens = usage.GetProperty("prompt_tokens").GetInt32(),
-                        OutputTokens = usage.GetProperty("completion_tokens").GetInt32(),
-                        TotalTokens = usage.GetProperty("total_tokens").GetInt32(),
-                        IsError = false
+                        model = modelName,
+                        messages = new[]
+                        {
+                            new { role = "user", content = userMessage }
+                        }
                     };
+
+                    var request = new HttpRequestMessage(HttpMethod.Post, "https://openrouter.ai/api/v1/chat/completions");
+                    request.Headers.Add("Authorization", $"Bearer {apiKey}");
+                    request.Content = new StringContent(
+                        JsonSerializer.Serialize(requestBody),
+                        Encoding.UTF8,
+                        "application/json"
+                    );
+
+                    var response = await httpClient.SendAsync(request);
+                    var responseBody = await response.Content.ReadAsStringAsync();
+
+                    if (response.IsSuccessStatusCode)
+                    {
+                        var jsonResponse = JsonSerializer.Deserialize<JsonElement>(responseBody);
+                        var text = jsonResponse.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString() ?? "No response";
+                        
+                        var usage = jsonResponse.GetProperty("usage");
+                        var result = new AiResponse
+                        {
+                            Text = text,
+                            InputTokens = usage.GetProperty("prompt_tokens").GetInt32(),
+                            OutputTokens = usage.GetProperty("completion_tokens").GetInt32(),
+                            TotalTokens = usage.GetProperty("total_tokens").GetInt32(),
+                            IsError = false
+                        };
+                        
+                        activity?.SetTag("ai.response.tokens", result.TotalTokens);
+                        activity?.SetTag("http.status_code", 200);
+                        return result;
+                    }
+                    else
+                    {
+                        Log($"[OpenRouter Error] {response.StatusCode}: {responseBody}\n");
+                        activity?.SetTag("http.status_code", (int)response.StatusCode);
+                        activity?.SetTag("error", true);
+                        return new AiResponse 
+                        { 
+                            Text = $"Error calling AI model: {response.StatusCode}",
+                            IsError = true
+                        };
+                    }
                 }
-                else
+                catch (Exception ex)
                 {
-                    Log($"[OpenRouter Error] {response.StatusCode}: {responseBody}\n");
+                    Log($"[OpenRouter Exception] {ex.Message}\n");
+                    activity?.SetTag("error", true);
+                    activity?.SetTag("error.message", ex.Message);
                     return new AiResponse 
                     { 
-                        Text = $"Error calling AI model: {response.StatusCode}",
+                        Text = $"Error: {ex.Message}",
                         IsError = true
                     };
                 }
-            }
-            catch (Exception ex)
-            {
-                Log($"[OpenRouter Exception] {ex.Message}\n");
-                return new AiResponse 
-                { 
-                    Text = $"Error: {ex.Message}",
-                    IsError = true
-                };
             }
         }
 
@@ -200,59 +222,76 @@ namespace HelloDotNet
         /// <returns>AI response with text and token usage</returns>
         public static async Task<AiResponse> CallCohere(string userMessage, string modelName, string apiKey)
         {
-            try
+            using (var activity = Observe.StartActivity("cohere.chat", ActivityKind.Client,
+                new Dictionary<string, object> 
+                { 
+                    { "ai.provider", "cohere" },
+                    { "ai.model", modelName },
+                    { "message.length", userMessage?.Length ?? 0 }
+                }))
             {
-                var requestBody = new
+                try
                 {
-                    model = modelName,
-                    message = userMessage
-                };
-
-                var request = new HttpRequestMessage(HttpMethod.Post, "https://api.cohere.ai/v1/chat");
-                request.Headers.Add("Authorization", $"Bearer {apiKey}");
-                request.Content = new StringContent(
-                    JsonSerializer.Serialize(requestBody),
-                    Encoding.UTF8,
-                    "application/json"
-                );
-
-                var response = await httpClient.SendAsync(request);
-                var responseBody = await response.Content.ReadAsStringAsync();
-
-                if (response.IsSuccessStatusCode)
-                {
-                    var jsonResponse = JsonSerializer.Deserialize<JsonElement>(responseBody);
-                    var text = jsonResponse.GetProperty("text").GetString() ?? "No response";
-                    
-                    // Cohere returns token usage in meta
-                    var tokens = jsonResponse.GetProperty("meta").GetProperty("tokens");
-                    return new AiResponse
+                    var requestBody = new
                     {
-                        Text = text,
-                        InputTokens = tokens.GetProperty("input_tokens").GetInt32(),
-                        OutputTokens = tokens.GetProperty("output_tokens").GetInt32(),
-                        TotalTokens = tokens.GetProperty("input_tokens").GetInt32() + tokens.GetProperty("output_tokens").GetInt32(),
-                        IsError = false
+                        model = modelName,
+                        message = userMessage
                     };
+
+                    var request = new HttpRequestMessage(HttpMethod.Post, "https://api.cohere.ai/v1/chat");
+                    request.Headers.Add("Authorization", $"Bearer {apiKey}");
+                    request.Content = new StringContent(
+                        JsonSerializer.Serialize(requestBody),
+                        Encoding.UTF8,
+                        "application/json"
+                    );
+
+                    var response = await httpClient.SendAsync(request);
+                    var responseBody = await response.Content.ReadAsStringAsync();
+
+                    if (response.IsSuccessStatusCode)
+                    {
+                        var jsonResponse = JsonSerializer.Deserialize<JsonElement>(responseBody);
+                        var text = jsonResponse.GetProperty("text").GetString() ?? "No response";
+                        
+                        // Cohere returns token usage in meta
+                        var tokens = jsonResponse.GetProperty("meta").GetProperty("tokens");
+                        var result = new AiResponse
+                        {
+                            Text = text,
+                            InputTokens = tokens.GetProperty("input_tokens").GetInt32(),
+                            OutputTokens = tokens.GetProperty("output_tokens").GetInt32(),
+                            TotalTokens = tokens.GetProperty("input_tokens").GetInt32() + tokens.GetProperty("output_tokens").GetInt32(),
+                            IsError = false
+                        };
+                        
+                        activity?.SetTag("ai.response.tokens", result.TotalTokens);
+                        activity?.SetTag("http.status_code", 200);
+                        return result;
+                    }
+                    else
+                    {
+                        Log($"[Cohere Error] {response.StatusCode}: {responseBody}\n");
+                        activity?.SetTag("http.status_code", (int)response.StatusCode);
+                        activity?.SetTag("error", true);
+                        return new AiResponse 
+                        { 
+                            Text = $"Error calling AI model: {response.StatusCode}",
+                            IsError = true
+                        };
+                    }
                 }
-                else
+                catch (Exception ex)
                 {
-                    Log($"[Cohere Error] {response.StatusCode}: {responseBody}\n");
+                    Log($"[Cohere Exception] {ex.Message}\n");
+                    activity?.SetTag("error", true);
+                    activity?.SetTag("error.message", ex.Message);
                     return new AiResponse 
                     { 
-                        Text = $"Error calling AI model: {response.StatusCode}",
+                        Text = $"Error: {ex.Message}",
                         IsError = true
                     };
                 }
-            }
-            catch (Exception ex)
-            {
-                Log($"[Cohere Exception] {ex.Message}\n");
-                return new AiResponse 
-                { 
-                    Text = $"Error: {ex.Message}",
-                    IsError = true
-                };
             }
         }
 
@@ -266,61 +305,78 @@ namespace HelloDotNet
         /// <returns>AI response with text and token usage</returns>
         public static async Task<AiResponse> CallMistral(string userMessage, string modelName, string apiKey)
         {
-            try
+            using (var activity = Observe.StartActivity("mistral.chat.completions", ActivityKind.Client,
+                new Dictionary<string, object> 
+                { 
+                    { "ai.provider", "mistral" },
+                    { "ai.model", modelName },
+                    { "message.length", userMessage?.Length ?? 0 }
+                }))
             {
-                var requestBody = new
+                try
                 {
-                    model = modelName,
-                    messages = new[]
+                    var requestBody = new
                     {
-                        new { role = "user", content = userMessage }
-                    }
-                };
-
-                var request = new HttpRequestMessage(HttpMethod.Post, "https://api.mistral.ai/v1/chat/completions");
-                request.Headers.Add("Authorization", $"Bearer {apiKey}");
-                request.Content = new StringContent(
-                    JsonSerializer.Serialize(requestBody),
-                    Encoding.UTF8,
-                    "application/json"
-                );
-
-                var response = await httpClient.SendAsync(request);
-                var responseBody = await response.Content.ReadAsStringAsync();
-
-                if (response.IsSuccessStatusCode)
-                {
-                    var jsonResponse = JsonSerializer.Deserialize<JsonElement>(responseBody);
-                    var text = jsonResponse.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString() ?? "No response";
-                    
-                    var usage = jsonResponse.GetProperty("usage");
-                    return new AiResponse
-                    {
-                        Text = text,
-                        InputTokens = usage.GetProperty("prompt_tokens").GetInt32(),
-                        OutputTokens = usage.GetProperty("completion_tokens").GetInt32(),
-                        TotalTokens = usage.GetProperty("total_tokens").GetInt32(),
-                        IsError = false
+                        model = modelName,
+                        messages = new[]
+                        {
+                            new { role = "user", content = userMessage }
+                        }
                     };
+
+                    var request = new HttpRequestMessage(HttpMethod.Post, "https://api.mistral.ai/v1/chat/completions");
+                    request.Headers.Add("Authorization", $"Bearer {apiKey}");
+                    request.Content = new StringContent(
+                        JsonSerializer.Serialize(requestBody),
+                        Encoding.UTF8,
+                        "application/json"
+                    );
+
+                    var response = await httpClient.SendAsync(request);
+                    var responseBody = await response.Content.ReadAsStringAsync();
+
+                    if (response.IsSuccessStatusCode)
+                    {
+                        var jsonResponse = JsonSerializer.Deserialize<JsonElement>(responseBody);
+                        var text = jsonResponse.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString() ?? "No response";
+                        
+                        var usage = jsonResponse.GetProperty("usage");
+                        var result = new AiResponse
+                        {
+                            Text = text,
+                            InputTokens = usage.GetProperty("prompt_tokens").GetInt32(),
+                            OutputTokens = usage.GetProperty("completion_tokens").GetInt32(),
+                            TotalTokens = usage.GetProperty("total_tokens").GetInt32(),
+                            IsError = false
+                        };
+                        
+                        activity?.SetTag("ai.response.tokens", result.TotalTokens);
+                        activity?.SetTag("http.status_code", 200);
+                        return result;
+                    }
+                    else
+                    {
+                        Log($"[Mistral Error] {response.StatusCode}: {responseBody}\n");
+                        activity?.SetTag("http.status_code", (int)response.StatusCode);
+                        activity?.SetTag("error", true);
+                        return new AiResponse 
+                        { 
+                            Text = $"Error calling AI model: {response.StatusCode}",
+                            IsError = true
+                        };
+                    }
                 }
-                else
+                catch (Exception ex)
                 {
-                    Log($"[Mistral Error] {response.StatusCode}: {responseBody}\n");
+                    Log($"[Mistral Exception] {ex.Message}\n");
+                    activity?.SetTag("error", true);
+                    activity?.SetTag("error.message", ex.Message);
                     return new AiResponse 
                     { 
-                        Text = $"Error calling AI model: {response.StatusCode}",
+                        Text = $"Error: {ex.Message}",
                         IsError = true
                     };
                 }
-            }
-            catch (Exception ex)
-            {
-                Log($"[Mistral Exception] {ex.Message}\n");
-                return new AiResponse 
-                { 
-                    Text = $"Error: {ex.Message}",
-                    IsError = true
-                };
             }
         }
 
@@ -343,10 +399,26 @@ namespace HelloDotNet
                 Environment.Exit(1);
             }
 
-            // Initialize LaunchDarkly configuration with the SDK key
-            var ldConfig = Configuration.Default(SdkKey);
+            // Get service name and version from environment variables
+            string serviceName = Environment.GetEnvironmentVariable("APPLICATION_ID") ?? "hello-dotnet-server";
+            string serviceVersion = Environment.GetEnvironmentVariable("APPLICATION_VERSION") ?? "1.0.0";
+
+            // Create a WebApplication builder for ASP.NET Core
+            var builder = WebApplication.CreateBuilder(args);
+
+            // Initialize LaunchDarkly configuration with the SDK key and observability plugin
+            var ldConfig = Configuration.Builder(SdkKey)
+                .StartWaitTime(TimeSpan.FromSeconds(5))
+                .Plugins(new PluginConfigurationBuilder()
+                    .Add(ObservabilityPlugin.Builder(builder.Services)
+                        .WithServiceName(serviceName)
+                        .WithServiceVersion(serviceVersion)
+                        .Build()
+                    )
+                ).Build();
 
             // Create the LaunchDarkly client for feature flags
+            // Client must be constructed before the web application
             var client = new LdClient(ldConfig);
             
             // Create the LaunchDarkly AI client for AI Configs
@@ -357,10 +429,30 @@ namespace HelloDotNet
             if (client.Initialized)
             {
                 Log("*** SDK successfully initialized!\n");
+                Observe.RecordLog("LaunchDarkly SDK initialized successfully", LogLevel.Information, new Dictionary<string, object>
+                {
+                    { "service.name", serviceName },
+                    { "service.version", serviceVersion }
+                });
+                Observe.RecordCount("sdk.initialization", 1, new Dictionary<string, object>
+                {
+                    { "status", "success" },
+                    { "service.name", serviceName }
+                });
             }
             else
             {
                 Log("*** SDK failed to initialize\n");
+                Observe.RecordLog("LaunchDarkly SDK failed to initialize", LogLevel.Error, new Dictionary<string, object>
+                {
+                    { "service.name", serviceName },
+                    { "service.version", serviceVersion }
+                });
+                Observe.RecordCount("sdk.initialization", 1, new Dictionary<string, object>
+                {
+                    { "status", "failure" },
+                    { "service.name", serviceName }
+                });
                 Environment.Exit(1);
             }
 
@@ -397,11 +489,30 @@ namespace HelloDotNet
             var aiConfigTracker = aiClient.Config("sample-ai-config", context, LdAiConfig.Disabled);
             if (aiConfigTracker.Config.Enabled)
             {
-                Log(string.Format("*** AI Config enabled with model: {0}\n", aiConfigTracker.Config.Model?.Name ?? "unknown"));
+                var modelName = aiConfigTracker.Config.Model?.Name ?? "unknown";
+                Log(string.Format("*** AI Config enabled with model: {0}\n", modelName));
+                Observe.RecordLog("AI Config enabled", LogLevel.Information, new Dictionary<string, object>
+                {
+                    { "ai.model", modelName },
+                    { "ai.config.key", "sample-ai-config" }
+                });
+                Observe.RecordCount("ai.config.evaluation", 1, new Dictionary<string, object>
+                {
+                    { "status", "enabled" },
+                    { "ai.model", modelName }
+                });
             }
             else
             {
                 Log("*** AI Config is disabled\n");
+                Observe.RecordLog("AI Config is disabled", LogLevel.Warning, new Dictionary<string, object>
+                {
+                    { "ai.config.key", "sample-ai-config" }
+                });
+                Observe.RecordCount("ai.config.evaluation", 1, new Dictionary<string, object>
+                {
+                    { "status", "disabled" }
+                });
             }
 
             // Set up real-time tracking for the "show-console" feature flag
@@ -487,150 +598,215 @@ namespace HelloDotNet
             Log("*** Waiting for changes \n");
             Log("*** Web interface available at http://localhost:5000\n");
 
-            // Start the ASP.NET Core web server
-            var host = WebHost.CreateDefaultBuilder(args)
-                .UseUrls("http://0.0.0.0:5000")  // Listen on all network interfaces, port 5000
-                .UseWebRoot("wwwroot")  // Serve static files from wwwroot directory
-                .Configure(app =>
+            // Configure the web server
+            builder.WebHost.UseUrls("http://0.0.0.0:5000");  // Listen on all network interfaces, port 5000
+            builder.WebHost.UseWebRoot("wwwroot");  // Serve static files from wwwroot directory
+
+            // Build the web application
+            var app = builder.Build();
+
+            // Serve index.html by default when accessing root URL
+            app.UseDefaultFiles();
+            // Enable serving static files (HTML, CSS, JS)
+            app.UseStaticFiles();
+            
+            // SSE endpoint for streaming console visibility flag changes
+            // This allows the web UI to show/hide the console output in real-time
+            app.MapGet("/console-visibility-stream", async (HttpContext httpContext) =>
+            {
+                // Set SSE headers
+                httpContext.Response.ContentType = "text/event-stream";
+                httpContext.Response.Headers["Cache-Control"] = "no-cache";
+                httpContext.Response.Headers["Connection"] = "keep-alive";
+                
+                // Send the current state of the "show-console" flag immediately
+                // This ensures the UI starts with the correct visibility state
+                var initialVisible = client.BoolVariation("show-console", context, true);
+                var initialData = JsonSerializer.Serialize(new { visible = initialVisible });
+                await httpContext.Response.WriteAsync($"data: {initialData}\n\n");
+                await httpContext.Response.Body.FlushAsync();
+                
+                // Register this connection to receive future flag updates
+                consoleVisibilityConnections.Add(httpContext.Response);
+                
+                // Keep the connection alive with periodic keepalive messages
+                try
                 {
-                    // Serve index.html by default when accessing root URL
-                    app.UseDefaultFiles();
-                    // Enable serving static files (HTML, CSS, JS)
-                    app.UseStaticFiles();
-                    
-                    // SSE endpoint for streaming console visibility flag changes
-                    // This allows the web UI to show/hide the console output in real-time
-                    app.Map("/console-visibility-stream", consoleStreamApp =>
+                    while (!httpContext.RequestAborted.IsCancellationRequested)
                     {
-                        consoleStreamApp.Run(async httpContext =>
-                        {
-                            // Set SSE headers
-                            httpContext.Response.ContentType = "text/event-stream";
-                            httpContext.Response.Headers["Cache-Control"] = "no-cache";
-                            httpContext.Response.Headers["Connection"] = "keep-alive";
-                            
-                            // Send the current state of the "show-console" flag immediately
-                            // This ensures the UI starts with the correct visibility state
-                            var initialVisible = client.BoolVariation("show-console", context, true);
-                            var initialData = JsonSerializer.Serialize(new { visible = initialVisible });
-                            await httpContext.Response.WriteAsync($"data: {initialData}\n\n");
-                            await httpContext.Response.Body.FlushAsync();
-                            
-                            // Register this connection to receive future flag updates
-                            consoleVisibilityConnections.Add(httpContext.Response);
-                            
-                            // Keep the connection alive with periodic keepalive messages
-                            try
-                            {
-                                while (!httpContext.RequestAborted.IsCancellationRequested)
-                                {
-                                    await Task.Delay(30000);  // Wait 30 seconds
-                                    await httpContext.Response.WriteAsync(":keepalive\n\n");
-                                    await httpContext.Response.Body.FlushAsync();
-                                }
-                            }
-                            catch { /* Connection closed */ }
-                        });
+                        await Task.Delay(30000);  // Wait 30 seconds
+                        await httpContext.Response.WriteAsync(":keepalive\n\n");
+                        await httpContext.Response.Body.FlushAsync();
+                    }
+                }
+                catch { /* Connection closed */ }
+            });
+            
+            // SSE endpoint for streaming AI Config changes
+            // This updates the model badge in the web UI when the AI Config changes in LaunchDarkly
+            app.MapGet("/ai-config-stream", async (HttpContext httpContext) =>
+            {
+                // Set SSE headers
+                httpContext.Response.ContentType = "text/event-stream";
+                httpContext.Response.Headers["Cache-Control"] = "no-cache";
+                httpContext.Response.Headers["Connection"] = "keep-alive";
+                
+                // Send the current AI Config state immediately
+                // This ensures the UI displays the correct model from the start
+                var initialData = JsonSerializer.Serialize(new {
+                    model = aiConfigTracker.Config.Model?.Name ?? "Disabled",
+                    enabled = aiConfigTracker.Config.Enabled
+                });
+                await httpContext.Response.WriteAsync($"data: {initialData}\n\n");
+                await httpContext.Response.Body.FlushAsync();
+                
+                // Register this connection to receive future AI Config updates
+                // Updates are pushed via the FlagTracker event handler above
+                aiConfigConnections.Add(httpContext.Response);
+                
+                // Keep connection alive with periodic keepalive messages
+                try
+                {
+                    while (!httpContext.RequestAborted.IsCancellationRequested)
+                    {
+                        await Task.Delay(30000);  // Wait 30 seconds
+                        await httpContext.Response.WriteAsync(":keepalive\n\n");
+                        await httpContext.Response.Body.FlushAsync();
+                    }
+                }
+                catch { /* Connection closed */ }
+            });
+            
+            // Config endpoint to provide LaunchDarkly client-side ID to the browser
+            // This allows the JavaScript SDK to initialize without hardcoding the ID
+            app.MapGet("/config", async (HttpContext httpContext) =>
+            {
+                var clientSideId = Environment.GetEnvironmentVariable("LAUNCHDARKLY_CLIENT_SIDE_ID") ?? "";
+                var applicationId = Environment.GetEnvironmentVariable("APPLICATION_ID") ?? "hello-dotnet-server";
+                var applicationVersion = Environment.GetEnvironmentVariable("APPLICATION_VERSION") ?? "1.0.0";
+                
+                httpContext.Response.ContentType = "application/json";
+                await httpContext.Response.WriteAsync(JsonSerializer.Serialize(new { 
+                    clientSideId = clientSideId,
+                    applicationId = applicationId,
+                    applicationVersion = applicationVersion
+                }));
+            });
+            
+            // Feedback endpoint for tracking user satisfaction (thumbs up/down)
+            // This associates user feedback with the AI Config that generated the response
+            app.MapPost("/feedback", async (HttpContext httpContext) =>
+            {
+                // Parse the JSON request body
+                using var reader = new StreamReader(httpContext.Request.Body);
+                var body = await reader.ReadToEndAsync();
+                var request = JsonSerializer.Deserialize<JsonElement>(body);
+                var messageId = request.GetProperty("messageId").GetInt32();
+                var isPositive = request.GetProperty("positive").GetBoolean();
+
+                // Look up the tracker from cache and track the feedback
+                // TryRemove is thread-safe and removes the entry after retrieving it
+                if (trackerCache.TryRemove(messageId, out var tracker))
+                {
+                    var feedback = isPositive ? Feedback.Positive : Feedback.Negative;
+                    tracker.TrackFeedback(feedback);  // Send feedback to LaunchDarkly
+                    Log($"[Feedback] Message {messageId}: {(isPositive ? "👍" : "👎")}\n");
+                    
+                    Observe.RecordLog("User feedback received", LogLevel.Information, new Dictionary<string, object>
+                    {
+                        { "feedback.type", isPositive ? "positive" : "negative" },
+                        { "message.id", messageId },
+                        { "endpoint", "/feedback" }
                     });
                     
-                    // SSE endpoint for streaming AI Config changes
-                    // This updates the model badge in the web UI when the AI Config changes in LaunchDarkly
-                    app.Map("/ai-config-stream", aiConfigStreamApp =>
+                    Observe.RecordCount("feedback.received", 1, new Dictionary<string, object>
                     {
-                        aiConfigStreamApp.Run(async httpContext =>
-                        {
-                            // Set SSE headers
-                            httpContext.Response.ContentType = "text/event-stream";
-                            httpContext.Response.Headers["Cache-Control"] = "no-cache";
-                            httpContext.Response.Headers["Connection"] = "keep-alive";
-                            
-                            // Send the current AI Config state immediately
-                            // This ensures the UI displays the correct model from the start
-                            var initialData = JsonSerializer.Serialize(new {
-                                model = aiConfigTracker.Config.Model?.Name ?? "Disabled",
-                                enabled = aiConfigTracker.Config.Enabled
+                        { "feedback.type", isPositive ? "positive" : "negative" }
+                    });
+                }
+                else
+                {
+                    // Tracker not found (may have expired or already been used)
+                    Log($"[Feedback] Message {messageId} not found in cache\n");
+                    
+                    Observe.RecordLog("Feedback tracker not found", LogLevel.Warning, new Dictionary<string, object>
+                    {
+                        { "message.id", messageId },
+                        { "endpoint", "/feedback" }
+                    });
+                    
+                    Observe.RecordCount("feedback.tracker_not_found", 1, new Dictionary<string, object>
+                    {
+                        { "message.id", messageId }
+                    });
+                }
+
+                // Return success response
+                httpContext.Response.StatusCode = 200;
+                await httpContext.Response.WriteAsync("{}");
+            });
+            
+            // Chat endpoint for handling user messages and generating AI responses
+            // This is the main endpoint that ties together LaunchDarkly AI Config with AI providers
+            app.MapPost("/chat", async (HttpContext httpContext) =>
+            {
+                using (var activity = Observe.StartActivity("chat.request", ActivityKind.Server,
+                    new Dictionary<string, object> 
+                    { 
+                        { "http.method", "POST" },
+                        { "http.route", "/chat" }
+                    }))
+                {
+                    // Parse the user's message from the request body
+                    using var reader = new StreamReader(httpContext.Request.Body);
+                    var body = await reader.ReadToEndAsync();
+                    var request = JsonSerializer.Deserialize<JsonElement>(body);
+                    var userMessage = request.GetProperty("message").GetString();
+
+                    Log($"[Chat] User: {userMessage}\n");
+                    activity?.SetTag("message.length", userMessage?.Length ?? 0);
+
+                            // Count incoming chat requests
+                            Observe.RecordCount("chat.requests", 1, new Dictionary<string, object>
+                            {
+                                { "endpoint", "/chat" }
                             });
-                            await httpContext.Response.WriteAsync($"data: {initialData}\n\n");
-                            await httpContext.Response.Body.FlushAsync();
-                            
-                            // Register this connection to receive future AI Config updates
-                            // Updates are pushed via the FlagTracker event handler above
-                            aiConfigConnections.Add(httpContext.Response);
-                            
-                            // Keep connection alive with periodic keepalive messages
-                            try
+
+                            // Randomly generate errors for testing observability (10% chance)
+                            var random = new Random();
+                            if (random.Next(100) < 10)
                             {
-                                while (!httpContext.RequestAborted.IsCancellationRequested)
+                                var exception = new Exception("Randomly generated backend error for observability testing");
+                                Log($"[Error] Simulated error: {exception.Message}\n");
+                                
+                                // Record the error using the observability plugin
+                                try
                                 {
-                                    await Task.Delay(30000);  // Wait 30 seconds
-                                    await httpContext.Response.WriteAsync(":keepalive\n\n");
-                                    await httpContext.Response.Body.FlushAsync();
+                                    Observe.RecordException(exception, new Dictionary<string, object>
+                                    {
+                                        { "endpoint", "/chat" },
+                                        { "user_message", userMessage ?? "null" },
+                                        { "error_type", "simulated" }
+                                    });
+                                    
+                                    Observe.RecordCount("chat.errors", 1, new Dictionary<string, object>
+                                    {
+                                        { "error_type", "simulated" }
+                                    });
                                 }
-                            }
-                            catch { /* Connection closed */ }
-                        });
-                    });
-                    
-                    // Feedback endpoint for tracking user satisfaction (thumbs up/down)
-                    // This associates user feedback with the AI Config that generated the response
-                    app.Map("/feedback", feedbackApp =>
-                    {
-                        feedbackApp.Run(async httpContext =>
-                        {
-                            // Only accept POST requests
-                            if (httpContext.Request.Method != "POST")
-                            {
-                                httpContext.Response.StatusCode = 405;  // Method Not Allowed
+                                catch (Exception ex)
+                                {
+                                    Log($"[Warning] Could not record exception: {ex.Message}\n");
+                                }
+                                
+                                httpContext.Response.StatusCode = 500;
+                                httpContext.Response.ContentType = "application/json";
+                                await httpContext.Response.WriteAsync(JsonSerializer.Serialize(new { 
+                                    error = "Internal server error (simulated)",
+                                    message = exception.Message
+                                }));
                                 return;
                             }
-
-                            // Parse the JSON request body
-                            using var reader = new StreamReader(httpContext.Request.Body);
-                            var body = await reader.ReadToEndAsync();
-                            var request = JsonSerializer.Deserialize<JsonElement>(body);
-                            var messageId = request.GetProperty("messageId").GetInt32();
-                            var isPositive = request.GetProperty("positive").GetBoolean();
-
-                            // Look up the tracker from cache and track the feedback
-                            // TryRemove is thread-safe and removes the entry after retrieving it
-                            if (trackerCache.TryRemove(messageId, out var tracker))
-                            {
-                                var feedback = isPositive ? Feedback.Positive : Feedback.Negative;
-                                tracker.TrackFeedback(feedback);  // Send feedback to LaunchDarkly
-                                Log($"[Feedback] Message {messageId}: {(isPositive ? "👍" : "👎")}\n");
-                            }
-                            else
-                            {
-                                // Tracker not found (may have expired or already been used)
-                                Log($"[Feedback] Message {messageId} not found in cache\n");
-                            }
-
-                            // Return success response
-                            httpContext.Response.StatusCode = 200;
-                            await httpContext.Response.WriteAsync("{}");
-                        });
-                    });
-                    
-                    // Chat endpoint for handling user messages and generating AI responses
-                    // This is the main endpoint that ties together LaunchDarkly AI Config with AI providers
-                    app.Map("/chat", chatApp =>
-                    {
-                        chatApp.Run(async httpContext =>
-                        {
-                            // Only accept POST requests
-                            if (httpContext.Request.Method != "POST")
-                            {
-                                httpContext.Response.StatusCode = 405;  // Method Not Allowed
-                                return;
-                            }
-
-                            // Parse the user's message from the request body
-                            using var reader = new StreamReader(httpContext.Request.Body);
-                            var body = await reader.ReadToEndAsync();
-                            var request = JsonSerializer.Deserialize<JsonElement>(body);
-                            var userMessage = request.GetProperty("message").GetString();
-
-                            Log($"[Chat] User: {userMessage}\n");
 
                             // Get the current AI Config from LaunchDarkly
                             // This determines which AI model to use for this request
@@ -650,6 +826,13 @@ namespace HelloDotNet
                             {
                                 modelName = aiConfigTracker.Config.Model?.Name ?? "unknown";
                                 Log($"[Chat] Using model: {modelName}\n");
+                                
+                                Observe.RecordLog("AI chat request started", LogLevel.Information, new Dictionary<string, object>
+                                {
+                                    { "ai.model", modelName },
+                                    { "endpoint", "/chat" },
+                                    { "message.length", userMessage?.Length ?? 0 }
+                                });
                                 
                                 var startTime = DateTime.UtcNow;  // Start timing for latency tracking
                                 AiResponse aiResponse;
@@ -691,16 +874,48 @@ namespace HelloDotNet
                                 var latencyMs = (float)(DateTime.UtcNow - startTime).TotalMilliseconds;
                                 aiConfigTracker.TrackDuration(latencyMs);
                                 
+                                // Record latency metric
+                                Observe.RecordMetric("ai.generation.latency", latencyMs, new Dictionary<string, object>
+                                {
+                                    { "ai.model", modelName }
+                                });
+                                
                                 if (aiResponse.IsError)
                                 {
                                     // 2. Track that this request failed
                                     aiConfigTracker.TrackError();
                                     Log($"[Error] Generation failed\n");
+                                    
+                                    Observe.RecordLog("AI generation failed", LogLevel.Error, new Dictionary<string, object>
+                                    {
+                                        { "ai.model", modelName },
+                                        { "latency.ms", latencyMs },
+                                        { "error.message", aiResponse.Text }
+                                    });
+                                    
+                                    Observe.RecordCount("ai.generation.errors", 1, new Dictionary<string, object>
+                                    {
+                                        { "ai.model", modelName }
+                                    });
                                 }
                                 else
                                 {
                                     // 3. Track that this request succeeded
                                     aiConfigTracker.TrackSuccess();
+                                    
+                                    Observe.RecordLog("AI generation succeeded", LogLevel.Information, new Dictionary<string, object>
+                                    {
+                                        { "ai.model", modelName },
+                                        { "latency.ms", latencyMs },
+                                        { "tokens.total", aiResponse.TotalTokens },
+                                        { "tokens.input", aiResponse.InputTokens },
+                                        { "tokens.output", aiResponse.OutputTokens }
+                                    });
+                                    
+                                    Observe.RecordCount("ai.generation.success", 1, new Dictionary<string, object>
+                                    {
+                                        { "ai.model", modelName }
+                                    });
                                     
                                     // 4. Track token usage (cost tracking)
                                     // Only track tokens on successful responses
@@ -717,6 +932,20 @@ namespace HelloDotNet
                                             };
                                             aiConfigTracker.TrackTokens(usage);
                                             Log($"[Tokens] Input: {aiResponse.InputTokens}, Output: {aiResponse.OutputTokens}, Total: {aiResponse.TotalTokens}\n");
+                                            
+                                            // Record token metrics
+                                            Observe.RecordMetric("ai.tokens.input", aiResponse.InputTokens, new Dictionary<string, object>
+                                            {
+                                                { "ai.model", modelName }
+                                            });
+                                            Observe.RecordMetric("ai.tokens.output", aiResponse.OutputTokens, new Dictionary<string, object>
+                                            {
+                                                { "ai.model", modelName }
+                                            });
+                                            Observe.RecordMetric("ai.tokens.total", aiResponse.TotalTokens, new Dictionary<string, object>
+                                            {
+                                                { "ai.model", modelName }
+                                            });
                                         }
                                         catch (Exception ex)
                                         {
@@ -731,61 +960,60 @@ namespace HelloDotNet
                             var messageId = Interlocked.Increment(ref messageCounter);  // Thread-safe counter increment
                             trackerCache[messageId] = aiConfigTracker;
                             
-                            // Send JSON response back to the web client
-                            httpContext.Response.ContentType = "application/json";
-                            await httpContext.Response.WriteAsync(JsonSerializer.Serialize(new { 
-                                response = response,  // The AI-generated text
-                                model = modelName,  // Which model was used
-                                enabled = enabled,  // Whether AI Config is enabled
-                                messageId = messageId  // Unique ID for feedback tracking
-                            }));
-                        });
-                    });
+                    // Send JSON response back to the web client
+                    httpContext.Response.ContentType = "application/json";
+                    await httpContext.Response.WriteAsync(JsonSerializer.Serialize(new { 
+                        response = response,  // The AI-generated text
+                        model = modelName,  // Which model was used
+                        enabled = enabled,  // Whether AI Config is enabled
+                        messageId = messageId  // Unique ID for feedback tracking
+                    }));
                     
-                    // Server-Sent Events (SSE) endpoint for streaming console output to the web UI
-                    // This allows the web page to display real-time server logs
-                    app.Map("/stream", streamApp =>
+                    activity?.SetTag("ai.model", modelName);
+                    activity?.SetTag("ai.config.enabled", enabled);
+                    activity?.SetTag("http.status_code", 200);
+                }
+            });
+            
+            // Server-Sent Events (SSE) endpoint for streaming console output to the web UI
+            // This allows the web page to display real-time server logs
+            app.MapGet("/stream", async (HttpContext context) =>
+            {
+                // Set SSE headers
+                context.Response.ContentType = "text/event-stream";  // SSE MIME type
+                context.Response.Headers["Cache-Control"] = "no-cache";  // Don't cache events
+                context.Response.Headers["Connection"] = "keep-alive";  // Keep connection open
+                
+                // Send all existing log messages to this new connection
+                // This ensures new clients see the full console history
+                foreach (var msg in logMessages)
+                {
+                    // SSE format requires newlines to be escaped
+                    var escapedMsg = msg.Replace("\n", "\\n").Replace("\r", "");
+                    await context.Response.WriteAsync($"data: {escapedMsg}\n\n");
+                    await context.Response.Body.FlushAsync();
+                }
+                
+                // Register this connection to receive future log messages
+                activeConnections.Add(context.Response);
+                
+                // Keep the connection alive by sending periodic keepalive messages
+                // Without this, proxies or browsers might close the connection
+                try
+                {
+                    while (!context.RequestAborted.IsCancellationRequested)
                     {
-                        streamApp.Run(async context =>
-                        {
-                            // Set SSE headers
-                            context.Response.ContentType = "text/event-stream";  // SSE MIME type
-                            context.Response.Headers["Cache-Control"] = "no-cache";  // Don't cache events
-                            context.Response.Headers["Connection"] = "keep-alive";  // Keep connection open
-                            
-                            // Send all existing log messages to this new connection
-                            // This ensures new clients see the full console history
-                            foreach (var msg in logMessages)
-                            {
-                                // SSE format requires newlines to be escaped
-                                var escapedMsg = msg.Replace("\n", "\\n").Replace("\r", "");
-                                await context.Response.WriteAsync($"data: {escapedMsg}\n\n");
-                                await context.Response.Body.FlushAsync();
-                            }
-                            
-                            // Register this connection to receive future log messages
-                            activeConnections.Add(context.Response);
-                            
-                            // Keep the connection alive by sending periodic keepalive messages
-                            // Without this, proxies or browsers might close the connection
-                            try
-                            {
-                                while (!context.RequestAborted.IsCancellationRequested)
-                                {
-                                    await Task.Delay(1000);  // Wait 1 second
-                                    await context.Response.WriteAsync(":keepalive\n\n");  // SSE comment (ignored by client)
-                                    await context.Response.Body.FlushAsync();
-                                }
-                            }
-                            catch { /* Connection closed */ }
-                        });
-                    });
-                })
-                .Build();
+                        await Task.Delay(1000);  // Wait 1 second
+                        await context.Response.WriteAsync(":keepalive\n\n");  // SSE comment (ignored by client)
+                        await context.Response.Body.FlushAsync();
+                    }
+                }
+                catch { /* Connection closed */ }
+            });
 
             // Start the web server and block until shutdown
             // This keeps the application running and serving requests
-            host.Run();
+            app.Run();
         }
     }
 }

@@ -1,0 +1,264 @@
+import * as LDClient from 'launchdarkly-js-client-sdk';
+import 'bootstrap/dist/css/bootstrap.min.css';
+import 'bootstrap/dist/js/bootstrap.bundle.min.js';
+import Observe from '@launchdarkly/observability';
+import SessionReplay from '@launchdarkly/session-replay';
+
+// Severity levels for logging
+const Severity = {
+    DEBUG: 'debug',
+    INFO: 'info',
+    WARN: 'warn',
+    ERROR: 'error'
+};
+
+// DOM elements
+const consoleDiv = document.getElementById('console');
+const chatMessages = document.getElementById('chatMessages');
+const chatInput = document.getElementById('chatInput');
+const sendBtn = document.getElementById('sendBtn');
+const modelBadge = document.getElementById('modelBadge');
+const chatCard = document.getElementById('chatCard');
+const consoleCard = document.getElementById('consoleCard');
+
+// Initialize LaunchDarkly JavaScript SDK
+let ldClient = null;
+let observePlugin = null;
+
+fetch('/config')
+    .then(response => response.json())
+    .then(config => {
+        if (config.clientSideId && config.clientSideId !== '') {
+            // Create an anonymous context
+            const ldContext = {
+                kind: 'user',
+                anonymous: true
+            };
+            
+            // Initialize the LaunchDarkly client with observability plugins
+            observePlugin = new Observe({
+                networkRecording: {
+                    enabled: true,
+                    recordHeadersAndBody: true
+                },
+                environment: 'production'
+            });
+            
+            const sessionReplayPlugin = new SessionReplay({
+                privacySetting: 'default'
+            });
+            
+            ldClient = LDClient.initialize(config.clientSideId, ldContext, {
+                application: {
+                    id: config.applicationId,
+                    version: config.applicationVersion
+                },
+                plugins: [observePlugin, sessionReplayPlugin]
+            });
+            
+            ldClient.on('ready', function() {
+                console.log('LaunchDarkly JavaScript SDK initialized with observability');
+                
+                // Example: Evaluate flags client-side
+                const showConsole = ldClient.variation('show-console', true);
+                console.log('show-console flag (client-side):', showConsole);
+                
+                // Listen for flag changes
+                ldClient.on('change:show-console', function(newValue, oldValue) {
+                    console.log('show-console changed from', oldValue, 'to', newValue);
+                });
+            });
+            
+            ldClient.on('failed', function() {
+                const error = new Error('LaunchDarkly JavaScript SDK failed to initialize');
+                console.error(error.message)
+                    });
+                });
+            } else {
+                console.log('LaunchDarkly client-side ID not configured. Set LAUNCHDARKLY_CLIENT_SIDE_ID in .env to enable client-side SDK.');
+                initSpan.setAttribute('clientSideId.configured', false);
+                initSpan.end();
+            }
+        })
+        .catch(error => {
+            console.error('Failed to fetch LaunchDarkly config:', error);
+            initSpan.recordException(error);
+            initSpan.end();
+            LDObserve.recordError(error, 'Failed to fetch LaunchDarkly config', {
+                component: 'Config Fetch'
+            });
+        });
+});
+
+// Console SSE
+const eventSource = new EventSource('/stream');
+
+eventSource.onmessage = function(event) {
+    const message = event.data.replace(/\\n/g, '\n');
+    consoleDiv.textContent += message;
+    consoleDiv.scrollTop = consoleDiv.scrollHeight;
+};
+
+eventSource.onopen = function() {
+    LDObserve.recordLog('Console SSE connection established', Severity.DEBUG);
+};
+
+eventSource.onerror = function(event) {
+    consoleDiv.textContent += '\n[Connection lost]\n';
+    const error = new Error('Console SSE connection lost');
+    
+    LDObserve.recordError(error, 'SSE connection error', {
+        component: 'Console Stream'
+    });
+};
+
+// AI Config SSE
+const aiConfigStream = new EventSource('/ai-config-stream');
+
+aiConfigStream.onmessage = function(event) {
+    const data = JSON.parse(event.data);
+    modelBadge.textContent = data.model;
+    modelBadge.className = data.enabled ? 'badge bg-success' : 'badge bg-danger';
+    
+    LDObserve.recordLog(`AI Config updated: model=${data.model}, enabled=${data.enabled}`, Severity.INFO);
+    
+    // Show/hide chatbot based on enabled status
+    if (data.enabled) {
+        chatCard.style.display = 'block';
+    } else {
+        chatCard.style.display = 'none';
+    }
+};
+
+// Console visibility flag SSE
+const consoleStream = new EventSource('/console-visibility-stream');
+
+consoleStream.onmessage = function(event) {
+    const data = JSON.parse(event.data);
+    consoleCard.style.display = data.visible ? 'block' : 'none';
+    LDObserve.recordLog(`Console visibility changed: ${data.visible}`, Severity.DEBUG);
+};
+
+// Chat functionality
+let messageCounter = 0;
+
+function addMessage(text, isUser, messageId) {
+    const messageDiv = document.createElement('div');
+    messageDiv.className = `message ${isUser ? 'user' : 'assistant'}`;
+    
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble';
+    bubble.textContent = text;
+    
+    if (!isUser && messageId) {
+        const container = document.createElement('div');
+        container.appendChild(bubble);
+        
+        const feedbackDiv = document.createElement('div');
+        feedbackDiv.className = 'feedback-buttons';
+        
+        const thumbsUp = document.createElement('button');
+        thumbsUp.className = 'feedback-btn';
+        thumbsUp.innerHTML = '👍';
+        thumbsUp.onclick = () => sendFeedback(messageId, true, thumbsUp, thumbsDown);
+        
+        const thumbsDown = document.createElement('button');
+        thumbsDown.className = 'feedback-btn';
+        thumbsDown.innerHTML = '👎';
+        thumbsDown.onclick = () => sendFeedback(messageId, false, thumbsUp, thumbsDown);
+        
+        feedbackDiv.appendChild(thumbsUp);
+        feedbackDiv.appendChild(thumbsDown);
+        container.appendChild(feedbackDiv);
+        
+        messageDiv.appendChild(container);
+    } else {
+        messageDiv.appendChild(bubble);
+    }
+    
+    chatMessages.appendChild(messageDiv);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+async function sendFeedback(messageId, isPositive, thumbsUpBtn, thumbsDownBtn) {
+    // Track the entire feedback operation with a span
+    await LDObserve.startSpan('feedback.send', async (span) => {
+        try {
+            LDObserve.recordLog(`Sending feedback: messageId=${messageId}, positive=${isPositive}`, Severity.DEBUG);
+            
+            span.setAttribute('feedback.type', isPositive ? 'positive' : 'negative');
+            span.setAttribute('feedback.messageId', messageId);
+            
+            await fetch('/feedback', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ 
+                    messageId: messageId,
+                    positive: isPositive
+                })
+            });
+            
+            LDObserve.recordLog(`Feedback sent successfully: ${isPositive ? 'positive' : 'negative'}`, Severity.INFO);
+            
+            // Visual feedback
+            thumbsUpBtn.classList.toggle('active', isPositive);
+            thumbsDownBtn.classList.toggle('active', !isPositive);
+            thumbsUpBtn.disabled = true;
+            thumbsDownBtn.disabled = true;
+        } catch (error) {
+            console.error('Failed to send feedback:', error);
+            span.recordException(error);
+            LDObserve.recordError(error, 'Failed to send feedback', {
+                component: 'Feedback',
+                messageId: messageId
+            });
+        }
+    });
+}
+
+async function sendMessage() {
+    const message = chatInput.value.trim();
+    if (!message) return;
+    
+    addMessage(message, true);
+    chatInput.value = '';
+    sendBtn.disabled = true;
+    
+    const startTime = Date.now();
+    
+    try {
+        const response = await fetch('/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message: message })
+        });
+        
+        const elapsed = Date.now() - startTime;
+        const data = await response.json();
+        const msgId = ++messageCounter;
+        
+        // Log to observability if available
+        if (observePlugin && observePlugin.observe && observePlugin.observe.recordLog) {
+            observePlugin.observe.recordLog(`Chat: ${message.substring(0, 30)}... → ${data.model} (${elapsed}ms)`, Severity.INFO);
+        }
+        
+        addMessage(data.response, false, msgId);
+    } catch (error) {
+        console.error('Chat error:', error);
+        addMessage('Error: Could not get response', false);
+        
+        if (typeof LDObserve !== 'undefined' && LDObserve.recordError) {
+            LDObserve.recordError(error, 'Failed to send chat message', {
+                component: 'Chat'
+            });
+        }
+    } finally {
+        sendBtn.disabled = false;
+        chatInput.focus();
+    }
+}
+
+sendBtn.addEventListener('click', sendMessage);
+chatInput.addEventListener('keypress', (e) => {
+    if (e.key === 'Enter') sendMessage();
+});

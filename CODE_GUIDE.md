@@ -10,6 +10,7 @@ This application is a web server that:
 3. Routes chat messages to different AI providers (OpenRouter, Cohere, Mistral)
 4. Tracks metrics (latency, tokens, user feedback) back to LaunchDarkly
 5. Updates the UI in real-time when flags change
+6. Exports comprehensive observability data via OpenTelemetry (traces, metrics, logs)
 
 ## Key Concepts
 
@@ -104,27 +105,48 @@ This method does three things:
 
 ### 4. AI Provider Methods
 
-Each provider (OpenRouter, Cohere, Mistral) has its own method:
+Each provider (OpenRouter, Cohere, Mistral) has its own method wrapped in an observability span:
 
 ```csharp
 public static async Task<AiResponse> CallOpenRouter(...)
 {
-    // 1. Build the request
-    var requestBody = new { model = modelName, messages = [...] };
-    
-    // 2. Send HTTP POST to the provider's API
-    var response = await httpClient.SendAsync(request);
-    
-    // 3. Parse the response
-    var jsonResponse = JsonSerializer.Deserialize<JsonElement>(responseBody);
-    
-    // 4. Extract text and token usage
-    return new AiResponse
+    // Start an activity span for distributed tracing
+    using (var activity = Observe.StartActivity("openrouter.chat.completions", ActivityKind.Client,
+        new Dictionary<string, object> 
+        { 
+            { "ai.provider", "openrouter" },
+            { "ai.model", modelName },
+            { "message.length", userMessage?.Length ?? 0 }
+        }))
     {
-        Text = jsonResponse.GetProperty("choices")[0]...GetString(),
-        InputTokens = usage.GetProperty("prompt_tokens").GetInt32(),
-        ...
-    };
+        try
+        {
+            // 1. Build the request
+            var requestBody = new { model = modelName, messages = [...] };
+            
+            // 2. Send HTTP POST to the provider's API
+            var response = await httpClient.SendAsync(request);
+            
+            // 3. Parse the response
+            var jsonResponse = JsonSerializer.Deserialize<JsonElement>(responseBody);
+            
+            // 4. Extract text and token usage
+            var result = new AiResponse { ... };
+            
+            // 5. Add success tags to the span
+            activity?.SetTag("ai.response.tokens", result.TotalTokens);
+            activity?.SetTag("http.status_code", 200);
+            
+            return result;
+        }
+        catch (Exception ex)
+        {
+            // 6. Add error tags to the span
+            activity?.SetTag("error", true);
+            activity?.SetTag("error.message", ex.Message);
+            throw;
+        }
+    }
 }
 ```
 
@@ -133,36 +155,64 @@ Each AI provider has a slightly different API format:
 - OpenRouter & Mistral use OpenAI-compatible format
 - Cohere has its own format with different field names
 
+**Observability features:**
+- Each provider call is wrapped in a span for distributed tracing
+- Spans include attributes (provider, model, message length)
+- Success/error information is tagged on the span
+- Token counts are recorded as span attributes
+
 ### 5. Main Method - Initialization
 
 ```csharp
 static void Main(string[] args)
 {
-    // 1. Get SDK key from environment variable
+    // 1. Get SDK key and service metadata from environment variables
     string SdkKey = Environment.GetEnvironmentVariable("LAUNCHDARKLY_SDK_KEY");
+    string serviceName = Environment.GetEnvironmentVariable("APPLICATION_ID") ?? "hello-dotnet-server";
+    string serviceVersion = Environment.GetEnvironmentVariable("APPLICATION_VERSION") ?? "1.0.0";
     
-    // 2. Initialize LaunchDarkly clients
+    // 2. Create WebApplication builder (modern ASP.NET Core)
+    var builder = WebApplication.CreateBuilder(args);
+    
+    // 3. Initialize LaunchDarkly with Observability plugin
+    var ldConfig = Configuration.Builder(SdkKey)
+        .StartWaitTime(TimeSpan.FromSeconds(5))
+        .Plugins(new PluginConfigurationBuilder()
+            .Add(ObservabilityPlugin.Builder(builder.Services)
+                .WithServiceName(serviceName)
+                .WithServiceVersion(serviceVersion)
+                .Build()
+            )
+        ).Build();
+    
+    // 4. Create LaunchDarkly clients
     var client = new LdClient(ldConfig);              // For feature flags
     var aiClient = new LdAiClient(...);               // For AI Configs
     
-    // 3. Create a context (identifies this server)
+    // 5. Create a context (identifies this server)
     var context = Context.Builder(ContextKind.Of("ld-sdk"), "dot-net-server")
         .Set("sdkVersion", sdkVersion)
         .Build();
     
-    // 4. Evaluate a feature flag
+    // 6. Evaluate a feature flag
     var flagValue = client.BoolVariation("sample-feature", context, false);
     
-    // 5. Get AI Config
+    // 7. Get AI Config
     var aiConfigTracker = aiClient.Config("sample-ai-config", context, ...);
     
-    // 6. Set up flag change listeners
+    // 8. Set up flag change listeners
     client.FlagTracker.FlagChanged += ...
     
-    // 7. Start web server
-    var host = WebHost.CreateDefaultBuilder(args)...
+    // 9. Build and start web server
+    var app = builder.Build();
+    app.Run();
 }
 ```
+
+**Key changes for observability:**
+- Uses `WebApplication.CreateBuilder` (modern ASP.NET Core pattern)
+- Adds `ObservabilityPlugin` with service name and version
+- Plugin automatically exports OpenTelemetry data (traces, metrics, logs)
 
 ### 6. Flag Change Listeners
 
@@ -209,15 +259,23 @@ client.FlagTracker.FlagChanged += (sender, changeArgs) => {
 
 #### `/chat` (POST)
 - Receives user's message
+- **Starts observability span** for the entire request
+- **Records request counter** metric
+- **10% chance of random error** for observability testing
 - Gets current AI Config from LaunchDarkly
 - Routes to appropriate provider based on model name:
   - Contains "command" or "cohere" → Cohere
   - Contains "mistral" → Mistral
   - Everything else → OpenRouter
-- Tracks metrics:
+- Tracks LaunchDarkly AI metrics:
   - `TrackDuration(latencyMs)` - How long it took
   - `TrackSuccess()` or `TrackError()` - Whether it worked
   - `TrackTokens(usage)` - Token usage
+- **Records OpenTelemetry metrics**:
+  - `ai.generation.latency` - Response time
+  - `ai.generation.success/errors` - Success/failure counts
+  - `ai.tokens.input/output/total` - Token usage
+- **Logs structured events** (success/failure with attributes)
 - Caches the tracker with a message ID
 - Returns response to user
 
@@ -294,6 +352,121 @@ All these metrics appear in the LaunchDarkly dashboard under your AI Config's Mo
 
 You can compare these metrics across different AI Config variations to see which model performs best.
 
+## OpenTelemetry Observability
+
+The app exports comprehensive telemetry data using the LaunchDarkly Observability plugin.
+
+### Distributed Tracing (Spans)
+
+Spans create a trace showing the complete request flow:
+
+```csharp
+// Parent span for the entire chat request
+using (var activity = Observe.StartActivity("chat.request", ActivityKind.Server, ...))
+{
+    // Child span for the AI provider call
+    var aiResponse = await CallOpenRouter(...);  // Creates its own span
+    
+    // Add tags to the parent span
+    activity?.SetTag("ai.model", modelName);
+    activity?.SetTag("http.status_code", 200);
+}
+```
+
+**Span hierarchy:**
+```
+chat.request (parent)
+  └─ openrouter.chat.completions (child)
+```
+
+This shows:
+- How long the entire request took
+- How long just the AI provider call took
+- Which model was used
+- Whether it succeeded or failed
+
+### Metrics
+
+The app records various metrics using `Observe.RecordMetric()` and `Observe.RecordCount()`:
+
+```csharp
+// Counter: Increments by 1 each time
+Observe.RecordCount("chat.requests", 1, new Dictionary<string, object>
+{
+    { "endpoint", "/chat" }
+});
+
+// Gauge: Records a specific value
+Observe.RecordMetric("ai.generation.latency", latencyMs, new Dictionary<string, object>
+{
+    { "ai.model", modelName }
+});
+```
+
+**Metrics tracked:**
+- `sdk.initialization` - SDK startup success/failure
+- `ai.config.evaluation` - AI Config enabled/disabled
+- `chat.requests` - Total chat requests
+- `chat.errors` - Error count (10% random errors)
+- `ai.generation.success` - Successful generations by model
+- `ai.generation.errors` - Failed generations by model
+- `ai.generation.latency` - Response time in milliseconds
+- `ai.tokens.input/output/total` - Token usage
+- `feedback.received` - User feedback (positive/negative)
+
+### Logs
+
+The app exports structured logs using `Observe.RecordLog()`:
+
+```csharp
+Observe.RecordLog("AI generation succeeded", LogLevel.Information, new Dictionary<string, object>
+{
+    { "ai.model", modelName },
+    { "latency.ms", latencyMs },
+    { "tokens.total", aiResponse.TotalTokens }
+});
+```
+
+**Log levels:**
+- `LogLevel.Information` - Normal operations
+- `LogLevel.Warning` - Potential issues (e.g., feedback tracker not found)
+- `LogLevel.Error` - Errors (e.g., AI generation failed)
+
+All logs include structured attributes for filtering and correlation.
+
+### Random Error Generation
+
+For observability testing, 10% of chat requests randomly fail:
+
+```csharp
+var random = new Random();
+if (random.Next(100) < 10)
+{
+    var exception = new Exception("Randomly generated backend error for observability testing");
+    
+    // Record the exception with metadata
+    Observe.RecordException(exception, new Dictionary<string, object>
+    {
+        { "endpoint", "/chat" },
+        { "user_message", userMessage ?? "null" },
+        { "error_type", "simulated" }
+    });
+    
+    // Count the error
+    Observe.RecordCount("chat.errors", 1, new Dictionary<string, object>
+    {
+        { "error_type", "simulated" }
+    });
+    
+    return 500 error;
+}
+```
+
+This helps demonstrate:
+- Error tracking in your observability platform
+- Alert configuration
+- Error rate monitoring
+
 ## Thread Safety
 
 This app handles multiple concurrent requests. Thread-safe patterns used:
@@ -324,8 +497,14 @@ This app demonstrates:
 - ✅ AI Config management
 - ✅ Real-time updates via SSE
 - ✅ Multi-provider AI routing
-- ✅ Comprehensive metrics tracking
+- ✅ Comprehensive metrics tracking (LaunchDarkly AI metrics)
 - ✅ User feedback collection
 - ✅ Thread-safe concurrent request handling
+- ✅ **OpenTelemetry observability** (distributed tracing, metrics, logs)
+- ✅ **Structured logging** with attributes
+- ✅ **Error tracking** with random error generation
+- ✅ **Performance monitoring** with latency and token metrics
 
-The key insight: **LaunchDarkly acts as a control plane for your AI application**, letting you change models, providers, and configurations without deploying new code.
+The key insights:
+1. **LaunchDarkly acts as a control plane for your AI application**, letting you change models, providers, and configurations without deploying new code.
+2. **OpenTelemetry provides deep visibility** into your application's behavior, performance, and errors across the entire request lifecycle.

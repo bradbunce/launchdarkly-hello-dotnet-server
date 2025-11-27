@@ -20,11 +20,59 @@ This application demonstrates a production-ready AI chatbot that uses LaunchDark
 - Automatic provider detection based on model name
 - Real-time model badge updates when configuration changes
 
-### Metrics & Analytics
+### Metrics & Analytics (Backend)
 - **Duration Tracking**: Measures AI response latency in milliseconds
 - **Token Tracking**: Monitors input, output, and total token usage
 - **Success Tracking**: Records successful AI generations
 - **Feedback Tracking**: Captures user satisfaction via thumbs up/down
+
+### OpenTelemetry Observability (Backend)
+The backend uses LaunchDarkly's Observability plugin to export comprehensive telemetry:
+
+#### Distributed Tracing (Spans)
+- **Chat Request Spans**: Tracks the full lifecycle of each chat request
+- **AI Provider Spans**: Separate spans for OpenRouter, Cohere, and Mistral API calls
+- **Span Attributes**: Includes AI model, provider, message length, token counts, HTTP status codes
+- **Error Tracking**: Automatically records exceptions with error tags
+
+#### Metrics
+- **Counters**:
+  - `sdk.initialization` - SDK startup success/failure
+  - `ai.config.evaluation` - AI Config enabled/disabled counts
+  - `chat.requests` - Total chat requests
+  - `chat.errors` - Simulated error count (10% random errors)
+  - `ai.generation.success` - Successful AI generations by model
+  - `ai.generation.errors` - Failed AI generations by model
+  - `feedback.received` - User feedback (positive/negative)
+  - `feedback.tracker_not_found` - Missing feedback trackers
+
+- **Gauges**:
+  - `ai.generation.latency` - AI request latency in milliseconds
+  - `ai.tokens.input` - Input tokens used per request
+  - `ai.tokens.output` - Output tokens generated per request
+  - `ai.tokens.total` - Total tokens per request
+
+#### Logs
+- **Structured Logging**: All logs include attributes (model, latency, tokens, endpoints)
+- **Log Levels**: Information, Warning, Error
+- **Key Events**:
+  - SDK initialization
+  - AI Config changes
+  - Chat requests and responses
+  - User feedback
+  - Errors and exceptions
+
+#### Random Error Generation
+- 10% of chat requests randomly fail for observability testing
+- Errors are recorded via `Observe.RecordException()` with metadata
+- Helps demonstrate error tracking and alerting capabilities
+
+### Observability (Frontend)
+- **Session Replay**: Records user interactions for debugging and analysis
+- **Network Recording**: Captures all HTTP requests with headers and body
+- **Error Tracking**: Automatically captures and reports errors (25% demo error rate)
+- **Application Metadata**: Tracks application ID and version
+- **Random User Sessions**: Each page load creates a new user with unique GUID
 
 ### Real-Time Updates
 - Server-Sent Events (SSE) for live console output
@@ -61,12 +109,25 @@ This application demonstrates a production-ready AI chatbot that uses LaunchDark
    cp .env.example .env
    ```
 
-3. **Configure your environment variables**
+3. **Build the frontend bundle**
+   ```bash
+   npm install
+   npm run build
+   ```
+
+4. **Configure your environment variables**
    
    Edit `.env` and add your keys:
    ```bash
-   # Required: LaunchDarkly SDK key
+   # Required: LaunchDarkly Server SDK key
    LAUNCHDARKLY_SDK_KEY=sdk-your-key-here
+   
+   # Required: LaunchDarkly Client-Side ID (for frontend observability)
+   LAUNCHDARKLY_CLIENT_SIDE_ID=your-client-side-id-here
+   
+   # Optional: Application metadata
+   APPLICATION_ID=hello-dotnet-server
+   APPLICATION_VERSION=1.0.0
    
    # Optional: Feature flag key (defaults to "sample-feature")
    LAUNCHDARKLY_FLAG_KEY=sample-feature
@@ -77,13 +138,13 @@ This application demonstrates a production-ready AI chatbot that uses LaunchDark
    MISTRAL_API_KEY=your-mistral-key-here
    ```
 
-4. **Build and run with Docker**
+5. **Build and run with Docker**
    ```bash
    docker build -t launchdarkly-hello-dotnet-server .
    docker run --name "LaunchDarkly-Hello-DotNet-Server" -p 5000:5000 --env-file .env launchdarkly-hello-dotnet-server
    ```
 
-5. **Access the application**
+6. **Access the application**
    
    Open your browser to: `http://localhost:5000`
 
@@ -119,7 +180,9 @@ Create an AI Config in LaunchDarkly:
 - Models containing `mistral` → Routes to Mistral AI
 - All other models → Routes to OpenRouter (default)
 
-## 📊 Viewing Metrics
+## 📊 Viewing Metrics & Observability
+
+### Backend Metrics (AI Config)
 
 All AI interactions are tracked and sent to LaunchDarkly. View your metrics in the LaunchDarkly dashboard:
 
@@ -131,22 +194,114 @@ All AI interactions are tracked and sent to LaunchDarkly. View your metrics in t
    - **Success Rate**: Percentage of successful generations
    - **Feedback**: User satisfaction (thumbs up/down ratio)
 
+### OpenTelemetry Observability (Backend)
+
+The backend exports comprehensive telemetry data via OpenTelemetry:
+
+#### Distributed Tracing
+View distributed traces showing the complete request flow:
+- Parent span: `chat.request` (the HTTP endpoint handler)
+- Child spans: `openrouter.chat.completions`, `cohere.chat`, or `mistral.chat.completions` (AI provider calls)
+- Each span includes:
+  - Duration (how long each operation took)
+  - Attributes (model, provider, tokens, status codes)
+  - Error information (if the operation failed)
+
+#### Metrics Dashboard
+Create dashboards in your observability platform (Datadog, New Relic, Honeycomb, etc.) to visualize:
+- **Request Rate**: `chat.requests` counter
+- **Error Rate**: `chat.errors` and `ai.generation.errors` counters
+- **Latency**: `ai.generation.latency` gauge (p50, p95, p99)
+- **Token Usage**: `ai.tokens.total` gauge (track costs over time)
+- **Success Rate**: Ratio of `ai.generation.success` to total requests
+- **User Satisfaction**: Ratio of positive to negative feedback
+
+#### Logs
+All application logs are exported with structured attributes:
+- Filter by `ai.model` to see logs for specific models
+- Filter by `endpoint` to see logs for specific API routes
+- Filter by log level (Information, Warning, Error)
+- Correlate logs with traces using trace IDs
+
+#### Alerts
+Set up alerts based on metrics:
+- Alert when error rate exceeds 5%
+- Alert when p95 latency exceeds 5 seconds
+- Alert when token usage spikes unexpectedly
+- Alert when negative feedback exceeds 20%
+
+### Frontend Observability
+
+The frontend uses LaunchDarkly's JavaScript SDK with Observability and Session Replay plugins:
+
+#### Session Replay
+1. Navigate to **Observability** → **Session Replay** in LaunchDarkly
+2. Filter by application: `hello-dotnet-server`
+3. View recorded user sessions with:
+   - Mouse movements and clicks
+   - Form inputs (masked for privacy)
+   - Network requests
+   - Console logs
+   - Errors and exceptions
+
+#### Error Tracking
+- Errors appear in **Observability** → **Errors**
+- Demo errors are generated randomly (25% chance per message)
+- Error types include:
+  - NetworkLatencyError
+  - TokenLimitError
+  - RateLimitError
+  - CacheMissError
+  - ValidationError
+
+#### Network Recording
+- All HTTP requests are captured with headers and body
+- View in session replay timeline
+- Includes chat API calls, config fetches, and feedback submissions
+
+### Random User Sessions
+
+Each page load creates a new user with a unique GUID (e.g., `a3f2b8c1-4d5e-4f6a-9b8c-7d6e5f4a3b2c`), allowing you to:
+- Track individual user journeys
+- See separate session replays for each visit
+- Analyze behavior across different sessions
+- Test targeting rules with fresh contexts
+
 ## 🏗️ Architecture
 
 ### Technology Stack
+
+**Backend:**
 - **.NET 8.0**: Modern web framework
 - **LaunchDarkly Server SDK 8.10.4**: Feature flag management
 - **LaunchDarkly AI SDK 0.9.1**: AI Config and metrics tracking
-- **Bootstrap 5.3**: UI framework
+- **LaunchDarkly Observability Plugin 0.3.0**: OpenTelemetry integration
 - **Server-Sent Events (SSE)**: Real-time updates
+- **OpenTelemetry**: Distributed tracing, metrics, and logs
+
+**Frontend:**
+- **LaunchDarkly JavaScript SDK 3.9.0**: Client-side feature flags
+- **@launchdarkly/observability 0.4.9**: Network recording and error tracking
+- **@launchdarkly/session-replay 0.4.9**: User session recording
+- **Bootstrap 5.3**: UI framework
+- **Webpack 5**: Module bundler (no CDN dependencies)
 
 ### Context Configuration
-The app uses a custom LaunchDarkly context:
+
+**Backend Context:**
 - **Kind**: `ld-sdk`
 - **Key**: `dot-net-server`
 - **Attributes**: `sdkVersion` (tracks the SDK version in use)
 
-This allows you to target specific SDK versions or server instances with your feature flags.
+**Frontend Context:**
+- **Kind**: `user`
+- **Key**: Random GUID (generated on each page load)
+- **Anonymous**: `false` (treated as identified users)
+
+This allows you to:
+- Target specific SDK versions or server instances
+- Track individual user sessions
+- Test targeting rules with fresh user contexts
 
 ## 🔧 How It Works
 
@@ -229,7 +384,10 @@ When you change a flag or AI Config in LaunchDarkly, the SDK receives the update
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `LAUNCHDARKLY_SDK_KEY` | Yes | - | Your LaunchDarkly SDK key |
+| `LAUNCHDARKLY_SDK_KEY` | Yes | - | Your LaunchDarkly Server SDK key |
+| `LAUNCHDARKLY_CLIENT_SIDE_ID` | Yes | - | Your LaunchDarkly Client-Side ID (for frontend) |
+| `APPLICATION_ID` | No | `hello-dotnet-server` | Application identifier for observability |
+| `APPLICATION_VERSION` | No | `1.0.0` | Application version for observability |
 | `LAUNCHDARKLY_FLAG_KEY` | No | `sample-feature` | Feature flag key to evaluate |
 | `OPENROUTER_API_KEY` | No* | - | OpenRouter API key |
 | `COHERE_API_KEY` | No* | - | Cohere API key |
@@ -259,11 +417,42 @@ services:
     restart: unless-stopped
 ```
 
+## � Connectineg to Your Observability Platform
+
+The LaunchDarkly Observability plugin exports OpenTelemetry data. To send this data to your observability platform:
+
+### Option 1: OpenTelemetry Collector
+1. Set up an [OpenTelemetry Collector](https://opentelemetry.io/docs/collector/)
+2. Configure exporters for your platform (Datadog, New Relic, Honeycomb, etc.)
+3. The plugin automatically exports to the collector
+
+### Option 2: Direct Export
+Configure environment variables for direct export:
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=https://your-platform.com
+OTEL_EXPORTER_OTLP_HEADERS=api-key=your-api-key
+```
+
+### Supported Platforms
+- Datadog
+- New Relic
+- Honeycomb
+- Grafana Cloud
+- AWS X-Ray
+- Google Cloud Trace
+- Azure Monitor
+- Any OpenTelemetry-compatible platform
+
 ## 📚 Learn More
 
 - [LaunchDarkly AI Configs Documentation](https://docs.launchdarkly.com/home/ai-configs)
 - [LaunchDarkly .NET Server SDK](https://docs.launchdarkly.com/sdk/server-side/dotnet)
 - [LaunchDarkly .NET AI SDK](https://docs.launchdarkly.com/sdk/ai/dotnet)
+- [LaunchDarkly Observability Plugin](https://docs.launchdarkly.com/sdk/features/observability)
+- [LaunchDarkly JavaScript SDK](https://docs.launchdarkly.com/sdk/client-side/javascript)
+- [LaunchDarkly Observability](https://docs.launchdarkly.com/home/observability)
+- [LaunchDarkly Session Replay](https://docs.launchdarkly.com/home/observability/session-replay)
+- [OpenTelemetry Documentation](https://opentelemetry.io/docs/)
 
 ## 🤝 Contributing
 
