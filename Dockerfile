@@ -11,10 +11,12 @@ RUN dotnet restore
 # Copy source code
 COPY HelloDotNet/ HelloDotNet/
 
-# Build the application
-RUN dotnet build -c Release --no-restore
+# Build and publish the application
+RUN dotnet publish HelloDotNet/HelloDotNet.csproj -c Release -o out --no-restore
 
-# Run the application
-WORKDIR /app/HelloDotNet
+# Runtime stage
+FROM mcr.microsoft.com/dotnet/aspnet:8.0
+WORKDIR /app
+COPY --from=build /app/out .
 EXPOSE 5000
-ENTRYPOINT ["dotnet", "run", "--no-build", "-c", "Release"]
+ENTRYPOINT ["dotnet", "HelloDotNet.dll"]
