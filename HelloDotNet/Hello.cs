@@ -10,6 +10,12 @@ using System.Text.Json;  // For JSON serialization/deserialization
 using System.Threading;  // For thread-safe operations like Interlocked
 using System.Threading.Tasks;  // For async/await support
 
+// AWS SDK namespaces
+using Amazon;
+using Amazon.BedrockRuntime;
+using Amazon.BedrockRuntime.Model;
+using Amazon.Runtime;
+
 // LaunchDarkly SDK namespaces
 using LaunchDarkly.Sdk;  // Core SDK types
 using LaunchDarkly.Sdk.Server;  // Server-side SDK for feature flags
@@ -369,6 +375,100 @@ namespace HelloDotNet
                 catch (Exception ex)
                 {
                     Log($"[Mistral Exception] {ex.Message}\n");
+                    activity?.SetTag("error", true);
+                    activity?.SetTag("error.message", ex.Message);
+                    return new AiResponse 
+                    { 
+                        Text = $"Error: {ex.Message}",
+                        IsError = true
+                    };
+                }
+            }
+        }
+
+        /// <summary>
+        /// Calls the Amazon Bedrock API to generate an AI response.
+        /// Amazon Bedrock provides access to foundation models including Nova.
+        /// Uses AWS SDK with proper credential signing.
+        /// </summary>
+        /// <param name="userMessage">The user's input message</param>
+        /// <param name="modelName">The Bedrock model to use (e.g., "us.amazon.nova-micro-v1:0")</param>
+        /// <param name="accessKey">AWS access key ID</param>
+        /// <param name="secretKey">AWS secret access key</param>
+        /// <param name="region">AWS region (defaults to us-east-1)</param>
+        /// <returns>AI response with text and token usage</returns>
+        public static async Task<AiResponse> CallBedrock(string userMessage, string modelName, string accessKey, string secretKey, string region = "us-east-1")
+        {
+            using (var activity = Observe.StartActivity("bedrock.converse", ActivityKind.Client,
+                new Dictionary<string, object> 
+                { 
+                    { "ai.provider", "bedrock" },
+                    { "ai.model", modelName },
+                    { "message.length", userMessage?.Length ?? 0 },
+                    { "aws.region", region }
+                }))
+            {
+                try
+                {
+                    // Create AWS credentials
+                    var credentials = new BasicAWSCredentials(accessKey, secretKey);
+                    
+                    // Create Bedrock Runtime client
+                    var regionEndpoint = RegionEndpoint.GetBySystemName(region);
+                    using var client = new AmazonBedrockRuntimeClient(credentials, regionEndpoint);
+                    
+                    // Build the Converse API request
+                    var request = new ConverseRequest
+                    {
+                        ModelId = modelName,
+                        Messages = new List<Message>
+                        {
+                            new Message
+                            {
+                                Role = ConversationRole.User,
+                                Content = new List<ContentBlock>
+                                {
+                                    new ContentBlock { Text = userMessage }
+                                }
+                            }
+                        }
+                    };
+
+                    // Call Bedrock
+                    var response = await client.ConverseAsync(request);
+                    
+                    // Extract response text
+                    var text = response.Output.Message.Content[0].Text ?? "No response";
+                    
+                    // Extract token usage
+                    var result = new AiResponse
+                    {
+                        Text = text,
+                        InputTokens = response.Usage.InputTokens,
+                        OutputTokens = response.Usage.OutputTokens,
+                        TotalTokens = response.Usage.TotalTokens,
+                        IsError = false
+                    };
+                    
+                    activity?.SetTag("ai.response.tokens", result.TotalTokens);
+                    activity?.SetTag("http.status_code", 200);
+                    return result;
+                }
+                catch (AmazonBedrockRuntimeException ex)
+                {
+                    Log($"[Bedrock Error] {ex.ErrorCode}: {ex.Message}\n");
+                    activity?.SetTag("error", true);
+                    activity?.SetTag("error.code", ex.ErrorCode);
+                    activity?.SetTag("error.message", ex.Message);
+                    return new AiResponse 
+                    { 
+                        Text = $"Bedrock error: {ex.Message}",
+                        IsError = true
+                    };
+                }
+                catch (Exception ex)
+                {
+                    Log($"[Bedrock Exception] {ex.Message}\n");
                     activity?.SetTag("error", true);
                     activity?.SetTag("error.message", ex.Message);
                     return new AiResponse 
@@ -855,6 +955,17 @@ namespace HelloDotNet
                                     aiResponse = !string.IsNullOrEmpty(mistralKey)
                                         ? await CallMistral(userMessage, modelName, mistralKey)
                                         : new AiResponse { Text = "Mistral API key not configured.", IsError = true };
+                                }
+                                else if (modelName.ToLower().Contains("nova") || modelName.ToLower().Contains("amazon"))
+                                {
+                                    // Use Amazon Bedrock for Nova models
+                                    var awsAccessKey = Environment.GetEnvironmentVariable("AWS_ACCESS_KEY_ID");
+                                    var awsSecretKey = Environment.GetEnvironmentVariable("AWS_SECRET_ACCESS_KEY");
+                                    var awsRegion = Environment.GetEnvironmentVariable("AWS_REGION") ?? "us-east-1";
+                                    
+                                    aiResponse = !string.IsNullOrEmpty(awsAccessKey) && !string.IsNullOrEmpty(awsSecretKey)
+                                        ? await CallBedrock(userMessage, modelName, awsAccessKey, awsSecretKey, awsRegion)
+                                        : new AiResponse { Text = "AWS credentials not configured. Please set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.", IsError = true };
                                 }
                                 else
                                 {
